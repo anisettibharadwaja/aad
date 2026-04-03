@@ -106,6 +106,7 @@ export interface RoundScore {
 export interface MatchHistory {
   id: string;
   roomId: string;
+  gameType: 'leastcount' | 'callbreak' | 'uno';
   participants: { uid: string; displayName: string; photoURL?: string; score: number }[];
   winnerId: string;
   endedAt: number;
@@ -140,6 +141,12 @@ export interface UserProfile {
   photoURL?: string;
   wins: number;
   losses: number;
+  leastCountWins: number;
+  leastCountLosses: number;
+  callBreakWins: number;
+  callBreakLosses: number;
+  unoWins: number;
+  unoLosses: number;
   xp: number;
   level: number;
   matchHistory: MatchHistory[];
@@ -152,4 +159,23 @@ export interface Sound {
   label: string;
   icon: string;
   createdAt: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  uid: string;
+  displayName: string;
+  photoURL?: string;
+  text: string;
+  type: 'text' | 'emoji' | 'sound' | 'room_code';
+  payload?: any;
+  createdAt: number;
+}
+
+export interface Presence {
+  uid: string;
+  displayName: string;
+  photoURL?: string;
+  lastSeen: number;
+  isOnline: boolean;
 }

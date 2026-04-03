@@ -7,7 +7,6 @@ import { UserProfile } from '../types';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from '../lib/utils';
-import GlobalChat from './GlobalChat';
 
 interface DashboardProps {
   user: User;
@@ -459,8 +458,6 @@ export default function Dashboard({
           </div>
         )}
       </AnimatePresence>
-
-      <GlobalChat user={user} profile={profile} />
     </div>
   );
 }

@@ -4,7 +4,7 @@ import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
-import { GameState, Player, Card, CardRank, CardSuit, GameConfig, MatchHistory, UserProfile, CallBreakGame, CallBreakPlayer, UnoGame, UnoPlayer, UnoCard, UnoColor, UnoValue } from "./src/types";
+import { GameState, Player, Card, CardRank, CardSuit, GameConfig, MatchHistory, UserProfile, CallBreakGame, CallBreakPlayer, UnoGame, UnoPlayer, UnoCard, UnoColor, UnoValue, RoundScore } from "./src/types";
 
 // Helper: Update user profiles at end of game
 import { initializeApp as initializeClientApp } from "firebase/app";
@@ -53,33 +53,47 @@ if (fs.existsSync(configPath)) {
     const firebaseConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     
     // Initialize Admin SDK for server-side operations (bypasses rules)
-    // Note: In this environment, Admin SDK may have permission issues if project IDs mismatch.
-    // We use the Client SDK as a reliable fallback.
     let adminApp;
-    if (!admin.apps.length) {
-      adminApp = admin.initializeApp({
-        projectId: firebaseConfig.projectId
-      });
-      console.log(`[FIREBASE] Admin SDK initialized. Project: ${adminApp.options.projectId || firebaseConfig.projectId}`);
-    } else {
-      adminApp = admin.app();
+    try {
+      if (!admin.apps.length) {
+        // Try initializing with default credentials first (more reliable in this environment)
+        try {
+          adminApp = admin.initializeApp();
+          console.log(`[FIREBASE] Admin SDK initialized (Default). Project: ${adminApp.options.projectId}`);
+        } catch (e) {
+          console.warn("[FIREBASE] Default Admin SDK initialization failed, trying config...");
+          adminApp = admin.initializeApp({
+            projectId: firebaseConfig.projectId
+          });
+          console.log(`[FIREBASE] Admin SDK initialized (Config). Project: ${adminApp.options.projectId}`);
+        }
+      } else {
+        adminApp = admin.app();
+      }
+      
+      // Use the database ID from config if provided, otherwise use default
+      const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
+      console.log(`[FIREBASE] Using Firestore database: ${databaseId}`);
+      
+      if (databaseId !== '(default)') {
+        db = getAdminFirestore(adminApp, databaseId);
+      } else {
+        db = getAdminFirestore(adminApp);
+      }
+      console.log("[FIREBASE] Admin Firestore instance created.");
+    } catch (adminInitErr) {
+      console.error("[FIREBASE] Admin SDK initialization failed:", adminInitErr);
     }
-    
-    // Use the database ID from config if provided, otherwise use default
-    const databaseId = firebaseConfig.firestoreDatabaseId || '(default)';
-    console.log(`[FIREBASE] Using Firestore database: ${databaseId}`);
-    
-    if (databaseId !== '(default)') {
-      db = getAdminFirestore(adminApp, databaseId);
-    } else {
-      db = getAdminFirestore(adminApp);
-    }
-    console.log("[FIREBASE] Admin Firestore instance created.");
 
     // Ping test
-    db.collection('_system').doc('ping').set({ lastPing: Date.now(), env: process.env.NODE_ENV || 'development' })
-      .then(() => console.log("[FIREBASE] Ping test successful."))
-      .catch(err => console.error("[FIREBASE] Ping test failed:", err));
+    if (db) {
+      db.collection('_system').doc('ping').set({ lastPing: Date.now(), env: process.env.NODE_ENV || 'development' })
+        .then(() => console.log("[FIREBASE] Admin Ping test successful."))
+        .catch(err => {
+          console.error("[FIREBASE] Admin Ping test failed (disabling Admin SDK):", err);
+          db = null; // Disable Admin SDK if it's not working correctly
+        });
+    }
 
     // Initialize Client SDK for Firestore operations (uses API key)
     const clientApp = initializeClientApp(firebaseConfig);
@@ -93,9 +107,15 @@ if (fs.existsSync(configPath)) {
       console.log(`[FIREBASE] Client SDK initialized (UID: ${user.user.uid})`);
       
       // Ping test using Client SDK
-      clientSetDoc(clientDoc(clientDb, '_system', 'ping'), { lastPing: Date.now(), env: process.env.NODE_ENV || 'development' })
-        .then(() => console.log("[FIREBASE] Client Ping test successful."))
-        .catch(err => console.error("[FIREBASE] Client Ping test failed:", err));
+      clientSetDoc(clientDoc(clientDb, 'test', 'connection'), { lastPing: Date.now(), env: process.env.NODE_ENV || 'development' })
+        .then(() => {
+          console.log("[FIREBASE] Client connection test successful.");
+          // If Admin SDK failed or is not initialized, use Client SDK as primary
+          if (!db) {
+            console.log("[FIREBASE] Using Client SDK as primary database instance.");
+          }
+        })
+        .catch(err => console.error("[FIREBASE] Client connection test failed:", err));
     }).catch(error => {
       console.error("[FIREBASE] Client auth failed:", error);
     });
@@ -105,121 +125,148 @@ if (fs.existsSync(configPath)) {
 }
 
 // Helper: Update user profiles at end of game (Server handles actual DB update for reliability)
-async function finalizeUserProfiles(game: GameState) {
-  console.log(`[PROFILE] Finalizing game ${game.roomId} for ${game.players.length} players. Winner: ${game.winnerId}`);
+async function finalizeUserProfiles(game: any, gameType: 'leastcount' | 'callbreak' | 'uno') {
+  console.log(`[PROFILE] Finalizing ${gameType} game ${game.roomId} for ${game.players.length} players. Winner: ${game.winnerId}`);
   
-  if (!db) {
-    console.error("[PROFILE] DB not initialized. Cannot finalize profiles. Check firebase-applet-config.json and server initialization.");
-    return;
-  }
-
-  // Ensure we have a winner
-  if (!game.winnerId) {
-    console.warn("[PROFILE] No winnerId found for game", game.roomId);
-    // Fallback to lowest score
-    const sorted = [...game.players].sort((a, b) => a.totalScore - b.totalScore);
-    game.winnerId = sorted[0]?.uid;
-    console.log("[PROFILE] Fallback winner selected:", game.winnerId);
-  }
-
   const matchId = `match-${Date.now()}-${game.roomId}`;
+  
+  // Normalize round scores based on game type
+  let roundScores: RoundScore[] = [];
+  if (gameType === 'leastcount') {
+    roundScores = game.roundScores || [];
+  } else if (gameType === 'callbreak') {
+    const maxRounds = Math.max(...game.players.map((p: any) => p.roundScores?.length || 0));
+    for (let r = 0; r < maxRounds; r++) {
+      const scores: Record<string, number> = {};
+      game.players.forEach((p: any) => {
+        scores[p.uid] = p.roundScores?.[r] || 0;
+      });
+      roundScores.push({ round: r + 1, scores });
+    }
+  } else if (gameType === 'uno') {
+    const scores: Record<string, number> = {};
+    game.players.forEach((p: any) => {
+      scores[p.uid] = p.hand?.length || 0;
+    });
+    roundScores.push({ round: 1, scores });
+  }
+
   const matchHistory: MatchHistory = {
     id: matchId,
     roomId: game.roomId,
-    participants: game.players.map(p => ({
+    gameType,
+    participants: game.players.map((p: any) => ({
       uid: p.uid,
       displayName: p.displayName || 'Guest',
       photoURL: p.photoURL || '',
-      score: p.totalScore || 0
+      score: p.totalScore || p.score || 0
     })),
     winnerId: game.winnerId || 'unknown',
     endedAt: Date.now(),
-    roundScores: game.roundScores || []
+    roundScores
   };
 
-  // Save match to global collection
-  const clientDb = (global as any).clientDb;
+  // 1. Save match to global collection
+  let matchSaved = false;
   try {
-    console.log(`[MATCH] Attempting to save match ${matchId} to Firestore...`);
-    if (clientDb) {
-      await clientSetDoc(clientDoc(clientDb, 'matches', matchId), matchHistory);
-      console.log(`[MATCH] Successfully saved match ${matchId} to global collection (Client SDK)`);
-    } else if (db) {
-      await db.collection('matches').doc(matchId).set(matchHistory);
-      console.log(`[MATCH] Successfully saved match ${matchId} to global collection (Admin SDK)`);
-    } else {
-      console.error("[MATCH] No DB initialized.");
+    if (db) {
+      try {
+        await db.collection('matches').doc(matchId).set(matchHistory);
+        console.log(`[MATCH] Saved match ${matchId} (Admin SDK)`);
+        matchSaved = true;
+      } catch (adminErr) {
+        console.error(`[MATCH] Admin SDK save failed for ${matchId}:`, adminErr);
+      }
+    }
+    
+    if (!matchSaved) {
+      const clientDb = (global as any).clientDb;
+      if (clientDb) {
+        try {
+          await clientSetDoc(clientDoc(clientDb, 'matches', matchId), matchHistory);
+          console.log(`[MATCH] Saved match ${matchId} (Client SDK)`);
+          matchSaved = true;
+        } catch (clientErr) {
+          console.error(`[MATCH] Client SDK save failed for ${matchId}:`, clientErr);
+        }
+      }
     }
   } catch (err) {
-    console.error(`[MATCH] Failed to save match ${matchId}:`, err);
+    console.error(`[MATCH] Fatal error saving match ${matchId}:`, err);
   }
 
+  // 2. Update each player's profile
   for (const player of game.players) {
-    if (player.isBot) {
-      console.log(`[PROFILE] Skipping bot update for ${player.uid}`);
-      continue;
-    }
+    if (player.isBot) continue;
 
     const isWinner = player.uid === game.winnerId;
     const xpGained = isWinner ? 50 : 10;
-    player.xpGained = xpGained; // Set for client display
+    player.xpGained = xpGained;
 
     try {
-      console.log(`[PROFILE] Updating user ${player.uid} (${player.displayName}). Winner: ${isWinner}, XP: +${xpGained}`);
-      const clientDb = (global as any).clientDb;
-      let profile: UserProfile;
+      let profile: UserProfile | null = null;
 
-      if (clientDb) {
-        const userSnap = await clientGetDoc(clientDoc(clientDb, 'users', player.uid));
-        if (userSnap.exists()) {
-          profile = userSnap.data() as UserProfile;
-          console.log(`[PROFILE] Existing profile found for ${player.uid}. Current XP: ${profile.xp}`);
-        } else {
-          console.log(`[PROFILE] No profile found for ${player.uid}. Creating new one.`);
-          profile = {
-            uid: player.uid,
-            displayName: player.displayName || 'Guest',
-            photoURL: player.photoURL || '',
-            wins: 0,
-            losses: 0,
-            xp: 0,
-            level: 1,
-            matchHistory: [],
-            following: [],
-            createdAt: Date.now()
-          };
+      // Try Admin SDK first (bypasses rules)
+      if (db) {
+        try {
+          const userRef = db.collection('users').doc(player.uid);
+          const userSnap = await userRef.get();
+          if (userSnap.exists) {
+            profile = userSnap.data() as UserProfile;
+          }
+        } catch (adminErr) {
+          console.warn(`[PROFILE] Admin SDK fetch failed for ${player.uid}:`, adminErr);
         }
-      } else if (db) {
-        const userRef = db.collection('users').doc(player.uid);
-        const userSnap = await userRef.get();
-        if (userSnap.exists) {
-          profile = userSnap.data() as UserProfile;
-          console.log(`[PROFILE] Existing profile found for ${player.uid}. Current XP: ${profile.xp}`);
-        } else {
-          console.log(`[PROFILE] No profile found for ${player.uid}. Creating new one.`);
-          profile = {
-            uid: player.uid,
-            displayName: player.displayName || 'Guest',
-            photoURL: player.photoURL || '',
-            wins: 0,
-            losses: 0,
-            xp: 0,
-            level: 1,
-            matchHistory: [],
-            following: [],
-            createdAt: Date.now()
-          };
+      } 
+      
+      // Fallback to Client SDK if Admin SDK failed or is null
+      if (!profile) {
+        const clientDb = (global as any).clientDb;
+        if (clientDb) {
+          try {
+            const userSnap = await clientGetDoc(clientDoc(clientDb, 'users', player.uid));
+            if (userSnap.exists()) {
+              profile = userSnap.data() as UserProfile;
+            }
+          } catch (e) {
+            console.warn(`[PROFILE] Client SDK fetch failed for ${player.uid} (likely permissions)`);
+          }
         }
-      } else {
-        console.error("[PROFILE] No DB initialized.");
-        continue;
+      }
+
+      // Create new profile if still null
+      if (!profile) {
+        profile = {
+          uid: player.uid,
+          displayName: player.displayName || 'Guest',
+          photoURL: player.photoURL || '',
+          wins: 0,
+          losses: 0,
+          leastCountWins: 0,
+          leastCountLosses: 0,
+          callBreakWins: 0,
+          callBreakLosses: 0,
+          unoWins: 0,
+          unoLosses: 0,
+          xp: 0,
+          level: 1,
+          matchHistory: [],
+          following: [],
+          createdAt: Date.now()
+        };
       }
 
       // Update stats
       if (isWinner) {
         profile.wins = (profile.wins || 0) + 1;
+        if (gameType === 'leastcount') profile.leastCountWins = (profile.leastCountWins || 0) + 1;
+        else if (gameType === 'callbreak') profile.callBreakWins = (profile.callBreakWins || 0) + 1;
+        else if (gameType === 'uno') profile.unoWins = (profile.unoWins || 0) + 1;
       } else {
         profile.losses = (profile.losses || 0) + 1;
+        if (gameType === 'leastcount') profile.leastCountLosses = (profile.leastCountLosses || 0) + 1;
+        else if (gameType === 'callbreak') profile.callBreakLosses = (profile.callBreakLosses || 0) + 1;
+        else if (gameType === 'uno') profile.unoLosses = (profile.unoLosses || 0) + 1;
       }
       profile.xp = (profile.xp || 0) + xpGained;
       profile.level = Math.floor(profile.xp / 100) + 1;
@@ -231,12 +278,29 @@ async function finalizeUserProfiles(game: GameState) {
         profile.matchHistory = profile.matchHistory.slice(0, 20);
       }
 
-      if (clientDb) {
-        await clientSetDoc(clientDoc(clientDb, 'users', player.uid), profile);
-      } else if (db) {
-        await db.collection('users').doc(player.uid).set(profile);
+      // Save updated profile
+      let saved = false;
+      if (db) {
+        try {
+          await db.collection('users').doc(player.uid).set(profile);
+          console.log(`[PROFILE] Updated ${player.displayName} (Admin SDK)`);
+          saved = true;
+        } catch (adminErr) {
+          console.warn(`[PROFILE] Admin SDK save failed for ${player.uid}:`, adminErr);
+        }
+      } 
+      
+      if (!saved) {
+        const clientDb = (global as any).clientDb;
+        if (clientDb) {
+          try {
+            await clientSetDoc(clientDoc(clientDb, 'users', player.uid), profile);
+            console.log(`[PROFILE] Updated ${player.displayName} (Client SDK)`);
+          } catch (e) {
+            console.error(`[PROFILE] Client SDK update failed for ${player.uid}:`, e);
+          }
+        }
       }
-      console.log(`[PROFILE] Successfully updated profile for ${player.displayName} (${player.uid}). New XP: ${profile.xp}, Level: ${profile.level}`);
     } catch (err) {
       console.error(`[PROFILE] Failed to update profile for ${player.uid}:`, err);
     }
@@ -303,12 +367,21 @@ app.get("/api/logs", (req, res) => {
   res.json({ logs });
 });
 
+app.get("/api/admin/logs", (req, res) => {
+  const adminEmail = req.headers['x-admin-email'] || req.query.email;
+  if (adminEmail !== 'anisettibharadwaja@gmail.com') {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  res.json({ logs });
+});
+
 app.all("/api/admin/reset-database", async (req, res) => {
   if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  if (!db) return res.status(500).json({ error: "DB not initialized" });
+  const clientDb = (global as any).clientDb;
+  if (!db && !clientDb) return res.status(500).json({ error: "DB not initialized" });
   
   // Security: Check for admin email in headers (passed from client)
   // For GET requests, we can also check query params if headers are hard to set (e.g., direct link)
@@ -316,9 +389,6 @@ app.all("/api/admin/reset-database", async (req, res) => {
   const adminEmail = Array.isArray(rawEmail) ? rawEmail[0] : rawEmail;
   const expectedAdmin = 'anisettibharadwaja@gmail.com';
   
-  console.log(`[ADMIN_DEBUG] Received admin email: "${adminEmail}"`);
-  console.log(`[ADMIN_DEBUG] Expected admin email: "${expectedAdmin}"`);
-
   if (!adminEmail || typeof adminEmail !== 'string' || adminEmail.toLowerCase() !== expectedAdmin.toLowerCase()) {
     console.warn(`[ADMIN_UNAUTHORIZED] Unauthorized reset attempt from: "${adminEmail}"`);
     return res.status(403).json({ 
@@ -331,34 +401,64 @@ app.all("/api/admin/reset-database", async (req, res) => {
   try {
     console.log(`[ADMIN] Resetting database requested by ${adminEmail}...`);
     
-    const collections = ['users', 'matches', '_system'];
+    const collections = ['users', 'matches', 'rooms', '_system', 'test', 'sounds'];
     let totalDeleted = 0;
 
-    for (const colName of collections) {
-      console.log(`[ADMIN] Clearing collection: ${colName}`);
-      const snapshot = await db.collection(colName).get();
-      if (snapshot.empty) {
-        console.log(`[ADMIN] Collection ${colName} is already empty.`);
-        continue;
-      }
+    if (db) {
+      // Admin SDK Deletion
+      for (const colName of collections) {
+        console.log(`[ADMIN] Clearing collection (Admin): ${colName}`);
+        const snapshot = await db.collection(colName).get();
+        if (snapshot.empty) continue;
 
-      // Delete in batches of 400 to be safe (Firestore limit is 500)
-      const docs = snapshot.docs;
-      console.log(`[ADMIN] Found ${docs.length} documents in ${colName}.`);
-      for (let i = 0; i < docs.length; i += 400) {
-        const batch = db.batch();
-        const chunk = docs.slice(i, i + 400);
-        chunk.forEach(doc => batch.delete(doc.ref));
-        await batch.commit();
-        totalDeleted += chunk.length;
-        console.log(`[ADMIN] Deleted chunk ${i/400 + 1} (${chunk.length} docs).`);
+        const docs = snapshot.docs;
+        for (let i = 0; i < docs.length; i += 400) {
+          const batch = db.batch();
+          const chunk = docs.slice(i, i + 400);
+          chunk.forEach(doc => batch.delete(doc.ref));
+          await batch.commit();
+          totalDeleted += chunk.length;
+        }
+      }
+    } else if (clientDb) {
+      // Client SDK Deletion (Fallback)
+      for (const colName of collections) {
+        try {
+          console.log(`[ADMIN] Clearing collection (Client): ${colName}`);
+          const snapshot = await clientGetDocs(clientCollection(clientDb, colName));
+          console.log(`[ADMIN] Found ${snapshot.size} documents in ${colName}`);
+          
+          if (snapshot.empty) continue;
+
+          const docs = snapshot.docs;
+          for (let i = 0; i < docs.length; i += 400) {
+            try {
+              const batch = clientWriteBatch(clientDb);
+              const chunk = docs.slice(i, i + 400);
+              chunk.forEach(doc => batch.delete(doc.ref));
+              await batch.commit();
+              totalDeleted += chunk.length;
+              console.log(`[ADMIN] Deleted chunk of ${chunk.length} from ${colName}`);
+            } catch (batchErr) {
+              console.error(`[ADMIN] Batch delete failed for ${colName}:`, batchErr);
+              throw batchErr;
+            }
+          }
+        } catch (colErr) {
+          console.error(`[ADMIN] Failed to clear collection ${colName}:`, colErr);
+          throw colErr;
+        }
       }
     }
     
     console.log(`[ADMIN] Reset successful. Deleted ${totalDeleted} documents.`);
-    res.json({ message: `Database reset successful. Deleted ${totalDeleted} documents across all collections.` });
+    res.json({ 
+      success: true, 
+      message: `Database reset successful. Deleted ${totalDeleted} documents.`,
+      sdkUsed: db ? 'Admin' : 'Client'
+    });
   } catch (error) {
-    console.error("[ADMIN] Reset failed:", error);
+    console.error("[ADMIN] Database reset failed:", error);
     res.status(500).json({ 
       error: "Reset failed", 
       details: error instanceof Error ? error.message : String(error),
@@ -412,6 +512,7 @@ const unoGames: Map<string, UnoGame> = new Map();
 const turnTimers: Map<string, NodeJS.Timeout> = new Map();
 const cbTurnTimers: Map<string, NodeJS.Timeout> = new Map();
 const showdownTimers: Map<string, NodeJS.Timeout> = new Map();
+const onlineUsers: Map<string, { uid: string; displayName: string; photoURL?: string }> = new Map();
 
 // Helper: Persist game to Firestore
 async function persistGame(game: GameState) {
@@ -776,10 +877,10 @@ function endTurn(game: GameState) {
   
   // Check if next player is a bot or away
   if (nextPlayer.isBot || nextPlayer.isAway) {
-    setTimeout(() => {
+    setTimeout(async () => {
       const g = games.get(game.roomId);
       if (g && g.turnIndex === nextIndex && g.status === 'playing') {
-        handleBotTurn(g, nextPlayer);
+        await handleBotTurn(g, nextPlayer);
       }
     }, 1500);
   }
@@ -921,7 +1022,7 @@ async function handleCall(game: GameState, playerUid: string) {
     game.winnerId = activePlayers[0]?.uid || [...game.players].sort((a,b) => a.totalScore - b.totalScore)[0].uid;
     game.logs.push(`Game Over! Winner is ${game.players.find(p => p.uid === game.winnerId)?.displayName}.`);
     console.log(`[GAME] Game ${game.roomId} ended. Winner: ${game.winnerId}. Finalizing profiles...`);
-    await finalizeUserProfiles(game);
+    await finalizeUserProfiles(game, 'leastcount');
   } else {
     // Auto-start next round after 10 seconds
     const timer = setTimeout(() => {
@@ -1197,17 +1298,17 @@ function updateUnoGame(game: UnoGame) {
   // Handle bot turns
   const currentPlayer = game.players[game.turnIndex];
   if (game.status === 'playing' && currentPlayer && currentPlayer.isBot) {
-    setTimeout(() => {
+    setTimeout(async () => {
       const g = unoGames.get(game.roomId);
       if (g && g.status === 'playing' && g.players[g.turnIndex].uid === currentPlayer.uid) {
-        handleUnoBotTurn(g, g.players[g.turnIndex]);
+        await handleUnoBotTurn(g, g.players[g.turnIndex]);
         updateUnoGame(g);
       }
     }, 1500);
   }
 }
 
-function playUnoCard(game: UnoGame, player: UnoPlayer, cardId: string, chosenColor: UnoColor) {
+async function playUnoCard(game: UnoGame, player: UnoPlayer, cardId: string, chosenColor: UnoColor) {
   const cardIndex = player.unoHand.findIndex(c => c.id === cardId);
   if (cardIndex === -1) return false;
 
@@ -1237,6 +1338,7 @@ function playUnoCard(game: UnoGame, player: UnoPlayer, cardId: string, chosenCol
     game.status = 'ended';
     game.winnerId = player.uid;
     game.logs.push(`${player.displayName} wins the game!`);
+    await finalizeUserProfiles(game, 'uno');
     return true;
   }
 
@@ -1303,7 +1405,7 @@ function drawUnoCard(game: UnoGame, player: UnoPlayer) {
   return true;
 }
 
-function handleUnoBotTurn(game: UnoGame, bot: UnoPlayer) {
+async function handleUnoBotTurn(game: UnoGame, bot: UnoPlayer) {
   let playableCards: UnoCard[] = [];
   
   if (game.pendingDrawCount > 0) {
@@ -1332,7 +1434,7 @@ function handleUnoBotTurn(game: UnoGame, bot: UnoPlayer) {
       game.logs.push(`${bot.displayName} said UNO!`);
     }
 
-    playUnoCard(game, bot, card.id, chosenColor);
+    await playUnoCard(game, bot, card.id, chosenColor);
   } else {
     drawUnoCard(game, bot);
   }
@@ -1430,15 +1532,53 @@ function startCallBreakTurnTimer(game: CallBreakGame) {
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  socket.on("global_message", ({ user, text }) => {
-    if (!text?.trim()) return;
+  socket.on("presence_update", ({ user }) => {
+    if (!user?.uid) return;
+    socket.data.uid = user.uid;
+    onlineUsers.set(user.uid, {
+      uid: user.uid,
+      displayName: user.displayName,
+      photoURL: user.photoURL
+    });
+    io.emit("online_count", onlineUsers.size);
+    io.emit("online_users", Array.from(onlineUsers.values()));
+  });
+
+  socket.on("global_message", async (msg: any) => {
+    if (!msg.text?.trim() && msg.type === 'text') return;
+    
     const message = {
       id: Math.random().toString(36).substring(7),
-      user,
-      text: text.substring(0, 200), // Limit message length
-      timestamp: Date.now()
+      uid: msg.uid,
+      displayName: msg.displayName,
+      photoURL: msg.photoURL,
+      text: msg.text?.substring(0, 500) || "",
+      type: msg.type || 'text',
+      payload: msg.payload,
+      createdAt: Date.now()
     };
+
+    // Persist to Firestore if possible
+    const clientDb = (global as any).clientDb;
+    if (clientDb) {
+      try {
+        await clientSetDoc(clientDoc(clientDb, 'chat', message.id), message);
+      } catch (err) {
+        console.error("[CHAT] Failed to persist message:", err);
+      }
+    }
+
     io.emit("global_message", message);
+  });
+
+  socket.on("disconnect", () => {
+    const uid = socket.data.uid;
+    if (uid) {
+      onlineUsers.delete(uid);
+      io.emit("online_count", onlineUsers.size);
+      io.emit("online_users", Array.from(onlineUsers.values()));
+    }
+    console.log("User disconnected:", socket.id);
   });
 
   socket.on("joinRoom", async ({ roomId, user, isCreating }) => {
@@ -1682,7 +1822,7 @@ io.on("connection", (socket) => {
           game.winnerId = humanPlayers[0].uid;
           game.logs.push(`Game Over! ${humanPlayers[0].displayName} is the last player standing.`);
           console.log(`[GAME] Game ${game.roomId} ended due to player leaving. Winner: ${game.winnerId}. Finalizing profiles...`);
-          await finalizeUserProfiles(game);
+          await finalizeUserProfiles(game, 'leastcount');
         } else if (humanPlayers.length === 0) {
           // Only bots left, delete the room
           games.delete(roomId);
@@ -1962,7 +2102,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("cb_nextRound", ({ roomId }) => {
+  socket.on("cb_nextRound", async ({ roomId }) => {
     const game = callBreakGames.get(roomId);
     if (game && game.status === 'roundEnd' && game.hostId === socket.data.uid) {
       if (game.currentRound >= game.config.rounds) {
@@ -1970,6 +2110,7 @@ io.on("connection", (socket) => {
         const sortedPlayers = [...game.players].sort((a, b) => b.totalScore - a.totalScore);
         game.winnerId = sortedPlayers[0].uid;
         game.logs.push(`Game Over! ${sortedPlayers[0].displayName} wins!`);
+        await finalizeUserProfiles(game, 'callbreak');
         updateCallBreakGame(game);
         return;
       }
@@ -2007,7 +2148,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("cb_leaveRoom", ({ roomId, user }) => {
+  socket.on("cb_leaveRoom", async ({ roomId, user }) => {
     const game = callBreakGames.get(roomId);
     if (game) {
       game.players = game.players.filter(p => p.uid !== user.uid);
@@ -2023,6 +2164,7 @@ io.on("connection", (socket) => {
         if (game.status !== 'waiting' && game.status !== 'ended') {
           game.status = 'ended';
           game.logs.push("Game ended because a player left.");
+          await finalizeUserProfiles(game, 'callbreak');
         }
         
         updateCallBreakGame(game);
@@ -2165,12 +2307,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("uno_playCard", ({ roomId, cardId, chosenColor }) => {
+  socket.on("uno_playCard", async ({ roomId, cardId, chosenColor }) => {
     const game = unoGames.get(roomId);
     if (game && game.status === 'playing') {
       const player = game.players[game.turnIndex];
       if (player.uid === socket.data.uid) {
-        if (playUnoCard(game, player, cardId, chosenColor)) {
+        if (await playUnoCard(game, player, cardId, chosenColor)) {
           updateUnoGame(game);
         }
       }
@@ -2236,7 +2378,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("uno_sound", { uid: socket.data.uid, soundId });
   });
 
-  socket.on("uno_leaveRoom", ({ roomId, user }) => {
+  socket.on("uno_leaveRoom", async ({ roomId, user }) => {
     const game = unoGames.get(roomId);
     if (game) {
       game.players = game.players.filter(p => p.uid !== user.uid);
@@ -2252,6 +2394,7 @@ io.on("connection", (socket) => {
         if (game.status !== 'waiting' && game.status !== 'ended') {
           game.status = 'ended';
           game.logs.push("Game ended because a player left.");
+          await finalizeUserProfiles(game, 'uno');
         }
         
         updateUnoGame(game);
@@ -2282,12 +2425,13 @@ io.on("connection", (socket) => {
             
             if (allAway) {
               console.log(`[GAME] All human players away in ${roomId}. Ending game in 30s...`);
-              setTimeout(() => {
+              setTimeout(async () => {
                 const g = callBreakGames.get(roomId);
                 if (g && g.players.filter(p => !p.isBot).every(p => p.isAway)) {
                   console.log(`[GAME] Game ${roomId} ended due to all players away.`);
                   g.status = 'ended';
                   g.logs.push("Game ended because all players disconnected.");
+                  await finalizeUserProfiles(g, 'callbreak');
                   updateCallBreakGame(g);
                   callBreakGames.delete(roomId);
                 }
@@ -2310,12 +2454,13 @@ io.on("connection", (socket) => {
             
             if (allAway) {
               console.log(`[GAME] All human players away in ${roomId}. Ending game in 30s...`);
-              setTimeout(() => {
+              setTimeout(async () => {
                 const g = unoGames.get(roomId);
                 if (g && g.players.filter(p => !p.isBot).every(p => p.isAway)) {
                   console.log(`[GAME] Game ${roomId} ended due to all players away.`);
                   g.status = 'ended';
                   g.logs.push("Game ended because all players disconnected.");
+                  await finalizeUserProfiles(g, 'uno');
                   updateUnoGame(g);
                   unoGames.delete(roomId);
                 }
@@ -2347,7 +2492,7 @@ io.on("connection", (socket) => {
                   g.winnerId = g.players.find(p => !p.isBot)?.uid || g.players[0].uid;
                   g.logs.push("Game ended because all players are away.");
                   console.log(`[GAME] Game ${g.roomId} ended due to inactivity. Finalizing profiles...`);
-                  await finalizeUserProfiles(g);
+                  await finalizeUserProfiles(g, 'leastcount');
                   updateGame(g);
                 }
               }, 30000);

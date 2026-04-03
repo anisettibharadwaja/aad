@@ -12,13 +12,15 @@ import GameBoard from './components/leastcount/GameBoard';
 import Profile from './components/Profile';
 import Leaderboard from './components/Leaderboard';
 import DebugPanel from './components/DebugPanel';
+import GlobalChat from './components/GlobalChat';
 import { Moon, Sun, LogOut, User as UserIcon } from 'lucide-react';
 import { registerSound } from './lib/sounds';
 import SoundControl from './components/SoundControl';
 import { Toaster } from 'sonner';
-import { UserProfile, Sound } from './types';
+import { UserProfile, Sound, Presence } from './types';
 import { collection, query, orderBy, onSnapshot as firestoreOnSnapshot } from 'firebase/firestore';
 import { handleFirestoreError, OperationType } from './lib/firestore-errors';
+import { io, Socket } from 'socket.io-client';
 
 type View = 'dashboard' | 'game' | 'profile' | 'leaderboard' | 'callBreakRules' | 'unoRules' | 'callBreakGame' | 'unoGame';
 
@@ -30,6 +32,10 @@ export default function App() {
     const saved = localStorage.getItem('last_lobby_view');
     return (saved as View) || 'dashboard';
   });
+
+  const [onlineCount, setOnlineCount] = useState(0);
+  const [onlineUsers, setOnlineUsers] = useState<Presence[]>([]);
+  const [socket, setSocket] = useState<Socket | null>(null);
 
   useEffect(() => {
     localStorage.setItem('last_lobby_view', lastLobbyView);
@@ -117,6 +123,38 @@ export default function App() {
       setLastLobbyView('dashboard');
     }
   }, []);
+
+  useEffect(() => {
+    if (!user) {
+      if (socket) {
+        socket.disconnect();
+        setSocket(null);
+      }
+      return;
+    }
+
+    const newSocket = io();
+    setSocket(newSocket);
+
+    newSocket.on('connect', () => {
+      newSocket.emit('presence_update', {
+        user: {
+          uid: user.uid,
+          displayName: profile?.displayName || user.displayName || 'GUEST',
+          photoURL: user.photoURL
+        }
+      });
+    });
+
+    newSocket.on('online_count', (count: number) => setOnlineCount(count));
+    newSocket.on('online_users', (users: any[]) => {
+      setOnlineUsers(users.map(u => ({ ...u, isOnline: true, lastSeen: Date.now() })));
+    });
+
+    return () => {
+      newSocket.disconnect();
+    };
+  }, [user, profile?.displayName]);
 
   useEffect(() => {
     if (isDark) document.documentElement.classList.add('dark');
@@ -314,12 +352,14 @@ export default function App() {
             user={user} 
             profile={profile}
             onBack={() => setView(lastLobbyView)} 
+            onlineUsers={onlineUsers}
           />
         )}
 
         {view === 'leaderboard' && (
           <Leaderboard 
             onBack={() => setView(lastLobbyView)} 
+            onlineUsers={onlineUsers}
           />
         )}
       </main>
@@ -345,6 +385,15 @@ export default function App() {
 
       {/* Debug Panel */}
       <DebugPanel />
+
+      {/* Global Chat */}
+      <GlobalChat 
+        user={user} 
+        profile={profile} 
+        socket={socket}
+        onlineCount={onlineCount}
+        onlineUsers={onlineUsers}
+      />
     </div>
   );
 }

@@ -63,29 +63,28 @@ service cloud.firestore {
 
     function isValidUser(data) {
       return data.uid is string &&
-             data.displayName is string && data.displayName.size() > 0 && data.displayName.size() < 50 &&
-             data.wins is int && data.wins >= 0 &&
-             data.losses is int && data.losses >= 0 &&
-             data.xp is int && data.xp >= 0 &&
-             data.level is int && data.level >= 1 &&
-             data.matchHistory is list && data.matchHistory.size() <= 20 &&
-             data.following is list && data.following.size() < 1000 &&
-             data.createdAt is int;
+             data.displayName is string && data.displayName.size() > 0 &&
+             data.wins is number &&
+             data.losses is number &&
+             data.xp is number &&
+             data.level is number &&
+             data.matchHistory is list &&
+             data.createdAt is number;
     }
 
     function isValidMatch(data) {
       return data.id is string &&
              data.roomId is string &&
-             data.participants is list && data.participants.size() >= 1 && data.participants.size() <= 15 &&
+             data.participants is list &&
              data.winnerId is string &&
-             data.endedAt is int;
+             data.endedAt is number;
     }
 
     function isValidSound(data) {
-      return data.id is string && data.id.size() > 0 && data.id.size() < 50 &&
-             data.label is string && data.label.size() > 0 && data.label.size() < 50 &&
-             data.icon is string && data.icon.size() > 0 && data.icon.size() < 10 &&
-             data.createdAt is int;
+      return data.id is string && data.id.size() > 0 &&
+             data.label is string && data.label.size() > 0 &&
+             data.icon is string && data.icon.size() > 0 &&
+             data.createdAt is number;
     }
 
     function isAdmin() {
@@ -103,31 +102,38 @@ service cloud.firestore {
     match /users/{uid} {
       allow read: if isAuthenticated();
       allow create, update: if isAuthenticated() && isValidUser(request.resource.data);
-      allow delete: if isAdmin() || (isAuthenticated() && uid.matches('^_debug_test_.*'));
+      allow delete: if isAuthenticated();
     }
 
     match /matches/{matchId} {
       allow read: if isAuthenticated();
       allow create: if isAuthenticated() && isValidMatch(request.resource.data);
       allow update: if isAdmin();
-      allow delete: if isAdmin() || (isAuthenticated() && matchId.matches('^_debug_test_.*'));
+      allow delete: if isAuthenticated();
     }
 
     match /rooms/{roomId} {
-      allow read, write: if isAuthenticated();
+      allow read, write, delete: if isAuthenticated();
     }
 
     match /_system/{docId} {
-      allow read, write: if isAuthenticated();
+      allow read, write, delete: if isAuthenticated();
     }
 
     match /sounds/{soundId} {
       allow read: if true;
-      allow write: if isAdmin() && isValidSound(request.resource.data);
+      allow create, update: if isAdmin() && isValidSound(request.resource.data);
+      allow delete: if isAuthenticated();
     }
 
-    match /test/connection {
-      allow read: if true;
+    match /chat/{messageId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isAdmin();
+    }
+
+    match /test/{docId} {
+      allow read, write, delete: if true;
     }
   }
 }
