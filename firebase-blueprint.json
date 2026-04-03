@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile data including stats and achievements.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "wins": { "type": "integer" },
+        "losses": { "type": "integer" },
+        "xp": { "type": "integer" },
+        "level": { "type": "integer" },
+        "matchHistory": { "type": "array", "items": { "$ref": "MatchHistory" } },
+        "following": { "type": "array", "items": { "type": "string" } },
+        "createdAt": { "type": "integer" }
+      },
+      "required": ["uid", "displayName", "wins", "losses", "xp", "level", "matchHistory", "createdAt"]
+    },
+    "MatchHistory": {
+      "title": "MatchHistory",
+      "description": "History of completed matches.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "roomId": { "type": "string" },
+        "participants": { "type": "array", "items": { "type": "object" } },
+        "winnerId": { "type": "string" },
+        "endedAt": { "type": "integer" }
+      },
+      "required": ["id", "roomId", "participants", "winnerId", "endedAt"]
+    },
+    "Sound": {
+      "title": "Sound",
+      "description": "Custom reaction sound definition.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "icon": { "type": "string" },
+        "createdAt": { "type": "integer" }
+      },
+      "required": ["id", "label", "icon", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "UserProfile",
+      "description": "Stores user profile information."
+    },
+    "/matches/{matchId}": {
+      "schema": "MatchHistory",
+      "description": "Stores match history records."
+    },
+    "/sounds/{soundId}": {
+      "schema": "Sound",
+      "description": "Stores custom reaction sound definitions."
+    }
+  }
+}
